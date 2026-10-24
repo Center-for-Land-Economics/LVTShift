@@ -53,8 +53,12 @@ The 2026 values the repeal model needs come from the County IT extract
 Each parcel is burned onto the land cover's 1 m grid, giving three shares of its area:
 `structure_share` (buildings), `paved_share` (non-road paving) and `parking_coverage` (pixels
 both paved and inside an OSM parking outline, so a parking outline drawn loosely over a
-building or a lawn does not count). Rules apply in priority order; thresholds are constants at
-the top of the script.
+building or a lawn does not count). Rules apply in priority order. The shares, the rules and
+their thresholds live in `lvt/idle_land.py`, shared with the Philadelphia comparison in
+`philly_land_tax_research` (`scripts/philadelphia_idle_land.py`), so both cities are classified
+identically; this script supplies Scranton's inputs and its rail and assessor-parking flags.
+It also writes `idle_land_taxable_shares.json` (each category's share of taxable land), which
+that comparison reads.
 
 1. **Surface parking lot**: `parking_coverage` at least `PARKING_COVERAGE` and buildings under
    `MAX_LOT_STRUCTURE`; or the assessor's description mentions parking, the improvement value
