@@ -1,27 +1,41 @@
 """Map Scranton's vacant lots and surface parking lots, parcel by parcel.
 
-Sources (both public, both cached under ./data/ on first run):
+Sources (all public, all cached under ./data/ on first run):
   - Lackawanna County GIS, GISViewer/LandRecords MapServer layer 85: parcel
     polygons joined to the assessment roll (owner, class code, land and
     improvement value). The GISViewer/Parcels layer the city notebook reads has
     the same polygons but its assessment fields are all null.
+  - Chesapeake Bay Land Use/Land Cover Database, 2024 Edition, Lackawanna
+    County 2021/22 raster (1 m; Chesapeake Conservancy / USGS ScienceBase).
+    Its Structures class is the building footprint layer; its Other Impervious
+    class is parking lots, driveways and sidewalks.
   - OpenStreetMap amenity=parking polygons via Overpass
-    (lvt.transit_utils.fetch_osm_parking).
+    (lvt.transit_utils.fetch_osm_parking), which say which paving is parking.
 
-The roll values in that layer are the pre-reassessment base values, so they are
-used here only to tell built parcels from unbuilt ones (improvement value and
-its share of total value), never as dollar amounts.
+The roll values in the county layer are the pre-reassessment base values, so
+they are used only to tell built parcels from unbuilt ones (improvement value
+and its share of total value), never as dollar amounts.
 
-Categories, in priority order:
-  Surface parking lot     OSM surface parking covers >= PARKING_COVERAGE of the
-                          parcel and improvements are < MAX_PARKING_IMP_SHARE of
-                          total value; or the assessor's description says
-                          "PARKING" and the improvement value is zero.
-  Parking with building   OSM parking covers >= PARKING_COVERAGE of the parcel
-                          but the parcel carries a building (a store's lot).
-  Vacant lot              improvement value is zero, parcel under LARGE_TRACT_ACRES.
-  Undeveloped tract       improvement value is zero, LARGE_TRACT_ACRES or more
-                          (wooded hillside, mine land, rail and utility land).
+Per parcel, from the land cover: structure_share (structures, including under
+tree canopy), paved_share (other impervious, including under canopy) and
+parking_coverage (pixels both paved and inside OSM parking). Categories, in
+priority order:
+  Surface parking lot     parking_coverage >= PARKING_COVERAGE and
+                          structure_share < MAX_LOT_STRUCTURE; or the assessor's
+                          description says "PARKING", the improvement value is
+                          zero and structure_share < MAX_LOT_STRUCTURE.
+  Parking with building   parking_coverage >= PARKING_COVERAGE with a structure
+                          on the parcel (a store and its lot).
+  Paved lot               paved_share >= MIN_PAVED_SHARE, structure_share <
+                          MAX_LOT_STRUCTURE, improvements < MAX_PARKING_IMP_SHARE
+                          of value, not in OSM: unmapped parking or a paved yard.
+  Vacant lot              improvement value zero, structure_share <
+                          MAX_VACANT_STRUCTURE, under LARGE_TRACT_ACRES.
+  Undeveloped tract       the same, LARGE_TRACT_ACRES or more (wooded hillside,
+                          mine land, rail and utility land).
+A parcel the roll calls unbuilt but the imagery shows a structure on is not
+vacant. The reverse (roll value, no structure in the imagery) is not used to
+call a parcel vacant: it is mostly houses hidden under tree canopy.
 Zero-improvement slivers under MIN_VACANT_SQFT (alley remnants) are left out.
 Taxable vs exempt comes from the second letter of the county class code
 (DwellingType: T = taxable, E = exempt).
@@ -37,27 +51,37 @@ import html
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import rasterio
 import requests
-from shapely.geometry import Polygon
+from rasterio.features import rasterize
+from rasterio.windows import from_bounds
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from lvt.transit_utils import ACRE_SQM, fetch_osm_parking, flag_parking_parcels  # noqa: E402
+from lvt.transit_utils import ACRE_SQM, fetch_osm_parking  # noqa: E402
 
 LAYER_URL = ('https://gis.lackawannacounty.org/arcgis/rest/services/'
              'GISViewer/LandRecords/MapServer/85/query')
+# ScienceBase item 68011bfad4be0263cab10002 (Lackawanna County, 42069), public S3 copy
+LULC_URL = ('https://prod-is-usgs-sb-prod-publish.s3.amazonaws.com/68011bfad4be0263cab10002/'
+            'lack_42069_lulc_2022_2024-Edition.tif')
+# Raster values from the 2024 Edition User Guide (General classes IMPS, IMPO, TCIS)
+STRUCTURE_CODES = (21, 24)  # Structures; Tree Canopy over Structures
+PAVED_CODES = (22, 25)      # Other Impervious; Tree Canopy over Other Impervious
 MUNICIPALITY = 'Scranton'
 UTM = 'EPSG:26918'  # UTM 18N, meters
 SQFT_PER_SQM = 10.7639
 
-PARKING_COVERAGE = 0.5
+PARKING_COVERAGE = 0.4      # share of parcel both paved and inside OSM parking
+MAX_LOT_STRUCTURE = 0.10    # a parking or paved lot carries no more building than this
+MAX_VACANT_STRUCTURE = 0.15 # a vacant lot carries no more building than this (sheds, overhang)
+MIN_PAVED_SHARE = 0.5
 MAX_PARKING_IMP_SHARE = 0.25
 LARGE_TRACT_ACRES = 1.0
 MIN_VACANT_SQFT = 500
@@ -71,6 +95,7 @@ CATEGORIES = [
     # key, label, color
     ('parking', 'Surface parking lot', '#d9480f'),
     ('parking_bldg', 'Mostly parking, with a building', '#f59f00'),
+    ('paved', 'Paved lot, not mapped as parking', '#9c36b5'),
     ('vacant', 'Vacant lot (under 1 acre)', '#1971c2'),
     ('tract', 'Undeveloped tract (1 acre+)', '#74b816'),
 ]
@@ -98,38 +123,18 @@ def fetch_parcels(refresh: bool = False) -> gpd.GeoDataFrame:
     return gdf
 
 
-def fetch_osm_buildings(boundary: gpd.GeoDataFrame, cache_path: Path, tiles: int = 4,
-                        timeout: int = 300) -> gpd.GeoDataFrame:
-    """OSM building footprints (ways) over the boundary's bounding box, cached.
-
-    The box is queried as tiles x tiles pieces; one query for the whole city
-    times out on the public Overpass server.
-    """
-    if cache_path.exists():
-        return gpd.read_file(cache_path).to_crs(UTM)
-    minx, miny, maxx, maxy = boundary.to_crs(4326).total_bounds
-    xs, ys = np.linspace(minx, maxx, tiles + 1), np.linspace(miny, maxy, tiles + 1)
-    polys = {}
-    for i in range(tiles):
-        for j in range(tiles):
-            query = (f'[out:json][timeout:180];way["building"]'
-                     f'({ys[j]},{xs[i]},{ys[j + 1]},{xs[i + 1]});out geom;')
-            for attempt in range(4):  # the public server answers 502/504 under load
-                resp = requests.post('https://overpass-api.de/api/interpreter', data=query.encode(),
-                                     headers={'User-Agent': 'LVTShift/1.0'}, timeout=timeout)
-                if resp.status_code not in (429, 502, 503, 504):
-                    break
-                time.sleep(30 * (attempt + 1))
-            resp.raise_for_status()
-            for el in resp.json()['elements']:
-                coords = [(p['lon'], p['lat']) for p in el.get('geometry', [])]
-                if len(coords) >= 4 and coords[0] == coords[-1]:
-                    polys[el['id']] = Polygon(coords)  # keyed by id: tiles overlap at edges
-    bldg = gpd.GeoDataFrame({'osm_id': list(polys)}, geometry=list(polys.values()), crs=4326)
-    bldg['geometry'] = bldg.geometry.buffer(0)
-    bldg = bldg.to_crs(UTM)
-    bldg.to_file(cache_path)
-    return bldg
+def fetch_land_cover(refresh: bool = False) -> Path:
+    """Download (once) the Lackawanna County 2021/22 land cover raster."""
+    path = DATA_DIR / 'lulc' / LULC_URL.rsplit('/', 1)[1]
+    if path.exists() and not refresh:
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with requests.get(LULC_URL, stream=True, timeout=600) as r:
+        r.raise_for_status()
+        with open(path, 'wb') as fh:
+            for chunk in r.iter_content(1 << 20):
+                fh.write(chunk)
+    return path
 
 
 def prepare_parcels(raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -148,27 +153,61 @@ def prepare_parcels(raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return out
 
 
-def classify(parcels: gpd.GeoDataFrame, parking: gpd.GeoDataFrame,
-             buildings: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Add parking_coverage and category columns.
+def land_cover_shares(parcels: gpd.GeoDataFrame, parking: gpd.GeoDataFrame,
+                      lulc_path: Path) -> gpd.GeoDataFrame:
+    """Add structure_share, paved_share and parking_coverage from the 1 m raster.
 
-    Building footprints are cut out of the parking area first, so a parking
-    outline drawn loosely over a building does not count that building as lot.
+    Parcels are burned onto the raster grid; where parcel polygons overlap, a
+    pixel goes to the later parcel. Shares are of each parcel's own pixels.
     """
-    paved = parking.union_all().difference(buildings.union_all())
-    out = flag_parking_parcels(parcels, paved, coverage_threshold=PARKING_COVERAGE)
-    out['parking_coverage'] = (out['parking_overlap_sqm']
-                               / out['parcel_sqm'].replace(0, np.nan)).fillna(0)
-    out['acres'] = out['parcel_sqm'] / ACRE_SQM
-    no_building = out['ImprovedValue'].fillna(0).eq(0)
-    text_parking = out['Dimensions'].fillna('').str.contains('PARKING') & no_building
+    with rasterio.open(lulc_path) as src:
+        crs = src.crs
+        pp = parcels.to_crs(crs)
+        win = from_bounds(*pp.total_bounds, src.transform).round_offsets().round_lengths()
+        lc = src.read(1, window=win)
+        transform = src.window_transform(win)
+    ids = rasterize(((g, i + 1) for i, g in enumerate(pp.geometry)), out_shape=lc.shape,
+                    transform=transform, fill=0, dtype='int32')
+    in_osm_lot = rasterize(parking.to_crs(crs).geometry, out_shape=lc.shape,
+                           transform=transform, fill=0, dtype='uint8').astype(bool)
+    inside = ids > 0
+    idx, n = ids[inside], len(pp) + 1
+    px = np.bincount(idx, minlength=n)[1:]
+
+    def share(mask):
+        return np.bincount(idx, weights=mask[inside], minlength=n)[1:] / np.maximum(px, 1)
+
+    paved = np.isin(lc, PAVED_CODES)
+    out = parcels.copy()
+    out['structure_share'] = share(np.isin(lc, STRUCTURE_CODES))
+    out['paved_share'] = share(paved)
+    out['parking_coverage'] = share(paved & in_osm_lot)
+    return out
+
+
+def classify(parcels: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Add acres and category columns to parcels carrying land cover shares."""
+    out = parcels.copy()
+    out['acres'] = out.geometry.area / ACRE_SQM
+    no_building_value = out['ImprovedValue'].fillna(0).eq(0)
+    lot_structure = out['structure_share'] < MAX_LOT_STRUCTURE
+    mapped_parking = out['parking_coverage'] >= PARKING_COVERAGE
+    text_parking = out['Dimensions'].fillna('').str.contains('PARKING') & no_building_value
+    # The land cover maps rail ballast as Other Impervious, so rail corridors
+    # (RRL parcel numbers, railroad owners) would otherwise read as paved lots.
+    rail = (out['ParcelPIN'].str.contains('RRL')
+            | out['OwnerName'].fillna('').str.contains(r'RAIL ?ROAD|RAILWAY|\bR R\b', regex=True))
+    paved_lot = ((out['paved_share'] >= MIN_PAVED_SHARE) & lot_structure
+                 & (out['imp_share'] < MAX_PARKING_IMP_SHARE) & ~rail)
+    vacant = (no_building_value & (out['structure_share'] < MAX_VACANT_STRUCTURE)
+              & (out.geometry.area * SQFT_PER_SQM >= MIN_VACANT_SQFT))
 
     cat = pd.Series(None, index=out.index, dtype=object)
-    vacant = no_building & (out['parcel_sqm'] * SQFT_PER_SQM >= MIN_VACANT_SQFT)
     cat[vacant & (out['acres'] >= LARGE_TRACT_ACRES)] = 'tract'
     cat[vacant & (out['acres'] < LARGE_TRACT_ACRES)] = 'vacant'
-    cat[out['is_parking_lot'] & (out['imp_share'] >= MAX_PARKING_IMP_SHARE)] = 'parking_bldg'
-    cat[(out['is_parking_lot'] & (out['imp_share'] < MAX_PARKING_IMP_SHARE)) | text_parking] = 'parking'
+    cat[paved_lot] = 'paved'
+    cat[mapped_parking & ~lot_structure] = 'parking_bldg'
+    cat[(mapped_parking | text_parking) & lot_structure] = 'parking'
     out['category'] = cat
     return out
 
@@ -216,6 +255,7 @@ def write_map(flagged: gpd.GeoDataFrame, parking: gpd.GeoDataFrame, n_parcels: i
         'pid': r.ParcelPIN, 'adr': _clean(r.LOCATION), 'own': _clean(r.OwnerName),
         'cat': r.category, 'tx': bool(r.taxable), 'cls': _clean(r.DwellingType),
         'ac': round(float(r.acres), 3), 'pk': round(float(r.parking_coverage) * 100),
+        'st': round(float(r.structure_share) * 100), 'pv': round(float(r.paved_share) * 100),
         'desc': _clean(r.Dimensions),
     })
     osm_feats = _features(parking, lambda r: {'t': _clean(r.parking_type) or 'untagged'})
@@ -229,18 +269,22 @@ def write_map(flagged: gpd.GeoDataFrame, parking: gpd.GeoDataFrame, n_parcels: i
            .replace('__CENTER__', json.dumps([round(center.y, 5), round(center.x, 5)]))
            .replace('__NPARCELS__', json.dumps(n_parcels))
            .replace('__PARAMS__', html.escape(
-               f'Surface parking: OpenStreetMap surface parking covers at least '
-               f'{PARKING_COVERAGE:.0%} of the parcel and buildings make up under '
-               f'{MAX_PARKING_IMP_SHARE:.0%} of its assessed value, or the assessor\'s '
-               f'description says parking and it has no building value. Vacant: no '
-               f'building value; slivers under {MIN_VACANT_SQFT:,} sq ft are left out.')))
+               f'Surface parking: at least {PARKING_COVERAGE:.0%} of the parcel is paved '
+               f'ground inside an OpenStreetMap parking lot, and buildings cover under '
+               f'{MAX_LOT_STRUCTURE:.0%} of it in the 2021/22 land cover (or the '
+               f'assessor\'s description says parking and it is unbuilt). Paved lot: at '
+               f'least {MIN_PAVED_SHARE:.0%} paved with no building, but not mapped as '
+               f'parking in OpenStreetMap, so it may be parking or a paved yard. Vacant: '
+               f'no building value on the roll and buildings cover under '
+               f'{MAX_VACANT_STRUCTURE:.0%} of the parcel; slivers under '
+               f'{MIN_VACANT_SQFT:,} sq ft are left out.')))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(doc, encoding='utf-8')
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--refresh', action='store_true', help='re-download parcels and OSM parking')
+    ap.add_argument('--refresh', action='store_true', help='re-download parcels, land cover and OSM parking')
     args = ap.parse_args()
 
     raw = fetch_parcels(args.refresh)
@@ -251,19 +295,17 @@ def main():
     parking = fetch_osm_parking(parcels, str(osm_cache), to_crs=UTM,
                                 exclude_types=NON_SURFACE_PARKING)
 
-    bldg_cache = DATA_DIR / 'osm_buildings.gpkg'
-    if args.refresh and bldg_cache.exists():
-        bldg_cache.unlink()
-    buildings = fetch_osm_buildings(parcels, bldg_cache)
+    lulc_path = fetch_land_cover(args.refresh)
 
-    classified = classify(parcels, parking, buildings)
+    classified = classify(land_cover_shares(parcels, parking, lulc_path))
     flagged = classified[classified['category'].notna()].copy()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     summary = summarize(flagged)
     summary.to_csv(OUT_DIR / 'vacant_parking_summary.csv', index=False)
     cols = ['ParcelPIN', 'LOCATION', 'OwnerName', 'category', 'taxable', 'DwellingType',
-            'DwellingCode', 'acres', 'parking_coverage', 'LandValue', 'ImprovedValue', 'Dimensions']
+            'DwellingCode', 'acres', 'structure_share', 'paved_share', 'parking_coverage',
+            'LandValue', 'ImprovedValue', 'Dimensions']
     flagged[cols].sort_values(['category', 'acres'], ascending=[True, False]).to_csv(
         OUT_DIR / 'vacant_parking_parcels.csv', index=False)
     write_map(flagged, parking, len(parcels), OUT_DIR / 'vacant_parking_map.html')
@@ -323,10 +365,10 @@ _HTML = r"""<!doctype html>
   <div class="controls" id="controls"></div>
   <div class="stage">
     <div class="mapbox"><div id="map"></div></div>
-    <aside class="inspector" id="insp"><div class="hint"><b>Click any parcel</b> to see its parcel number, owner, class code and how much of it OpenStreetMap maps as parking.</div></aside>
+    <aside class="inspector" id="insp"><div class="hint"><b>Click any parcel</b> to see its parcel number, owner, class code, and how much of it is building, paving and mapped parking.</div></aside>
   </div>
-  <p class="ft"><b>How parcels are classified.</b> __PARAMS__ "Mostly parking, with a building" is a parcel at least half covered by parking that also holds a building, such as a store and its lot. Tax-exempt owners (government, churches, schools, hospitals) are drawn with a lighter fill and can be hidden. Assessed values in this county layer predate the 2026 reassessment and are used only to tell built from unbuilt parcels. OpenStreetMap misses some lots, and its outlines do not always line up with parcel lines.</p>
-  <p class="ft">Sources: Lackawanna County GIS (LandRecords parcels), OpenStreetMap contributors via Overpass. Base maps: OpenStreetMap, Esri World Imagery.</p>
+  <p class="ft"><b>How parcels are classified.</b> __PARAMS__ "Mostly parking, with a building" passes the same parking test but also holds a building, such as a store and its lot. Tax-exempt owners (government, churches, schools, hospitals) are drawn with a lighter fill and can be hidden. Assessed values in this county layer predate the 2026 reassessment and are used only to tell built from unbuilt parcels. Building and paving shares come from 1 m land cover mapped from 2021/22 aerial imagery; a building under dense tree canopy can be missed.</p>
+  <p class="ft">Sources: Lackawanna County GIS (LandRecords parcels); Chesapeake Bay Land Use/Land Cover Database 2024 Edition (Chesapeake Conservancy, USGS); OpenStreetMap contributors via Overpass. Base maps: OpenStreetMap, Esri World Imagery.</p>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -357,7 +399,9 @@ function inspect(p, lyr) {
     '<tr><td class="k">Owner</td><td class="v">' + esc(p.own || '—') + '</td></tr>' +
     '<tr><td class="k">Tax status</td><td class="v">' + (p.tx ? 'Taxable' : 'Exempt') + ' (class ' + esc(p.cls) + ')</td></tr>' +
     '<tr><td class="k">Size</td><td class="v">' + acres + '</td></tr>' +
-    '<tr><td class="k">Mapped as parking</td><td class="v">' + p.pk + '%</td></tr>' +
+    '<tr><td class="k">Building cover</td><td class="v">' + p.st + '%</td></tr>' +
+    '<tr><td class="k">Paved (non-road)</td><td class="v">' + p.pv + '%</td></tr>' +
+    '<tr><td class="k">Paved and mapped as parking</td><td class="v">' + p.pk + '%</td></tr>' +
     (p.desc ? '<tr><td class="k">Assessor note</td><td class="v">' + esc(p.desc) + '</td></tr>' : '') +
     '</tbody></table>';
 }
