@@ -16,7 +16,8 @@ The roll values in the county layer are the pre-reassessment base values, so
 they are used only to tell built parcels from unbuilt ones (improvement value
 and its share of total value), never as dollar amounts.
 
-Per parcel, from the land cover: structure_share (structures, including under
+Classification rules and thresholds live in lvt/idle_land.py, shared with the
+Philadelphia comparison. Per parcel, from the land cover: structure_share (structures, including under
 tree canopy), paved_share (other impervious, including under canopy) and
 parking_coverage (pixels both paved and inside OSM parking). Categories, in
 priority order:
@@ -56,37 +57,25 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-import rasterio
 import requests
-from rasterio.features import rasterize
-from rasterio.windows import from_bounds
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 sys.path.insert(0, str(REPO_ROOT))
-from lvt.transit_utils import ACRE_SQM, fetch_osm_parking  # noqa: E402
+from lvt.idle_land import (  # noqa: E402
+    ACRE_SQM, CHESAPEAKE_LULC_CODES, MAX_LOT_STRUCTURE, MAX_VACANT_STRUCTURE, MIN_PAVED_SHARE,
+    MIN_VACANT_SQFT, OSM_NON_SURFACE_PARKING, PARKING_COVERAGE, classify_idle, land_cover_shares,
+    taxable_land_shares,
+)
+from lvt.transit_utils import fetch_osm_parking  # noqa: E402
 
 LAYER_URL = ('https://gis.lackawannacounty.org/arcgis/rest/services/'
              'GISViewer/LandRecords/MapServer/85/query')
 # ScienceBase item 68011bfad4be0263cab10002 (Lackawanna County, 42069), public S3 copy
 LULC_URL = ('https://prod-is-usgs-sb-prod-publish.s3.amazonaws.com/68011bfad4be0263cab10002/'
             'lack_42069_lulc_2022_2024-Edition.tif')
-# Raster values from the 2024 Edition User Guide (General classes IMPS, IMPO, TCIS)
-STRUCTURE_CODES = (21, 24)  # Structures; Tree Canopy over Structures
-PAVED_CODES = (22, 25)      # Other Impervious; Tree Canopy over Other Impervious
 MUNICIPALITY = 'Scranton'
 UTM = 'EPSG:26918'  # UTM 18N, meters
-SQFT_PER_SQM = 10.7639
-
-PARKING_COVERAGE = 0.4      # share of parcel both paved and inside OSM parking
-MAX_LOT_STRUCTURE = 0.10    # a parking or paved lot carries no more building than this
-MAX_VACANT_STRUCTURE = 0.15 # a vacant lot carries no more building than this (sheds, overhang)
-MIN_PAVED_SHARE = 0.5
-MAX_PARKING_IMP_SHARE = 0.25
-LARGE_TRACT_ACRES = 1.0
-MIN_VACANT_SQFT = 500
-# OSM parking= values that are not surface lots
-NON_SURFACE_PARKING = ('underground', 'multi-storey', 'lane', 'rooftop', 'street_side')
 
 DATA_DIR = HERE / 'data'
 OUT_DIR = REPO_ROOT / 'analysis' / 'reports' / 'scranton'
@@ -153,62 +142,18 @@ def prepare_parcels(raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return out
 
 
-def land_cover_shares(parcels: gpd.GeoDataFrame, parking: gpd.GeoDataFrame,
-                      lulc_path: Path) -> gpd.GeoDataFrame:
-    """Add structure_share, paved_share and parking_coverage from the 1 m raster.
-
-    Parcels are burned onto the raster grid; where parcel polygons overlap, a
-    pixel goes to the later parcel. Shares are of each parcel's own pixels.
-    """
-    with rasterio.open(lulc_path) as src:
-        crs = src.crs
-        pp = parcels.to_crs(crs)
-        win = from_bounds(*pp.total_bounds, src.transform).round_offsets().round_lengths()
-        lc = src.read(1, window=win)
-        transform = src.window_transform(win)
-    ids = rasterize(((g, i + 1) for i, g in enumerate(pp.geometry)), out_shape=lc.shape,
-                    transform=transform, fill=0, dtype='int32')
-    in_osm_lot = rasterize(parking.to_crs(crs).geometry, out_shape=lc.shape,
-                           transform=transform, fill=0, dtype='uint8').astype(bool)
-    inside = ids > 0
-    idx, n = ids[inside], len(pp) + 1
-    px = np.bincount(idx, minlength=n)[1:]
-
-    def share(mask):
-        return np.bincount(idx, weights=mask[inside], minlength=n)[1:] / np.maximum(px, 1)
-
-    paved = np.isin(lc, PAVED_CODES)
-    out = parcels.copy()
-    out['structure_share'] = share(np.isin(lc, STRUCTURE_CODES))
-    out['paved_share'] = share(paved)
-    out['parking_coverage'] = share(paved & in_osm_lot)
-    return out
-
-
-def classify(parcels: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Add acres and category columns to parcels carrying land cover shares."""
-    out = parcels.copy()
+def classify(parcels: gpd.GeoDataFrame, shares: pd.DataFrame) -> gpd.GeoDataFrame:
+    """Parcels with their land cover shares, acres and idle-land category."""
+    out = parcels.join(shares)
     out['acres'] = out.geometry.area / ACRE_SQM
-    no_building_value = out['ImprovedValue'].fillna(0).eq(0)
-    lot_structure = out['structure_share'] < MAX_LOT_STRUCTURE
-    mapped_parking = out['parking_coverage'] >= PARKING_COVERAGE
-    text_parking = out['Dimensions'].fillna('').str.contains('PARKING') & no_building_value
     # The land cover maps rail ballast as Other Impervious, so rail corridors
     # (RRL parcel numbers, railroad owners) would otherwise read as paved lots.
     rail = (out['ParcelPIN'].str.contains('RRL')
             | out['OwnerName'].fillna('').str.contains(r'RAIL ?ROAD|RAILWAY|\bR R\b', regex=True))
-    paved_lot = ((out['paved_share'] >= MIN_PAVED_SHARE) & lot_structure
-                 & (out['imp_share'] < MAX_PARKING_IMP_SHARE) & ~rail)
-    vacant = (no_building_value & (out['structure_share'] < MAX_VACANT_STRUCTURE)
-              & (out.geometry.area * SQFT_PER_SQM >= MIN_VACANT_SQFT))
-
-    cat = pd.Series(None, index=out.index, dtype=object)
-    cat[vacant & (out['acres'] >= LARGE_TRACT_ACRES)] = 'tract'
-    cat[vacant & (out['acres'] < LARGE_TRACT_ACRES)] = 'vacant'
-    cat[paved_lot] = 'paved'
-    cat[mapped_parking & ~lot_structure] = 'parking_bldg'
-    cat[(mapped_parking | text_parking) & lot_structure] = 'parking'
-    out['category'] = cat
+    out['category'] = classify_idle(
+        shares, area_sqm=out.geometry.area, building_value=out['ImprovedValue'],
+        imp_share=out['imp_share'],
+        assessor_parking=out['Dimensions'].fillna('').str.contains('PARKING'), rail=rail)
     return out
 
 
@@ -293,11 +238,12 @@ def main():
     if args.refresh and osm_cache.exists():
         osm_cache.unlink()
     parking = fetch_osm_parking(parcels, str(osm_cache), to_crs=UTM,
-                                exclude_types=NON_SURFACE_PARKING)
+                                exclude_types=OSM_NON_SURFACE_PARKING)
 
     lulc_path = fetch_land_cover(args.refresh)
 
-    classified = classify(land_cover_shares(parcels, parking, lulc_path))
+    shares = land_cover_shares(parcels, parking, lulc_path, CHESAPEAKE_LULC_CODES)
+    classified = classify(parcels, shares)
     flagged = classified[classified['category'].notna()].copy()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -309,6 +255,9 @@ def main():
     flagged[cols].sort_values(['category', 'acres'], ascending=[True, False]).to_csv(
         OUT_DIR / 'vacant_parking_parcels.csv', index=False)
     write_map(flagged, parking, len(parcels), OUT_DIR / 'vacant_parking_map.html')
+    # Share of taxable land in each category, read by the Philadelphia comparison
+    shares_out = taxable_land_shares(classified['category'], classified['acres'], classified['taxable'])
+    (OUT_DIR / 'idle_land_taxable_shares.json').write_text(json.dumps(shares_out, indent=2))
 
     print(f'{len(parcels):,} Scranton parcels; {len(parking):,} OSM surface parking polygons')
     print(summary.to_string(index=False))

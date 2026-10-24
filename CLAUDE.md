@@ -78,6 +78,7 @@ lvt/policy_analysis.py → Identify vacant land, parking lots, development barri
 lvt/wage_tax_utils.py  → Wage-tax-for-land-tax swap — a different instrument, at tract granularity
 lvt/ubi_utils.py       → Full land-rent capture + per-capita dividend — a rent flow, not an assessed stock
 lvt/transit_utils.py   → GTFS feeds, routed walk-shed isochrones, OSM parking analysis
+lvt/idle_land.py       → Vacant / surface-parking / paved / undeveloped parcels from 1 m land cover + OSM + roll (Scranton map, Philly comparison)
 lvt/viz.py             → Scatter plots, quintile analysis, demographic charts, city report
 lvt/parcel_map.py      → Per-parcel GeoParquet export + self-contained interactive HTML map
 ```
