@@ -42,16 +42,43 @@ CRS_PLOT = 'EPSG:2271'  # PA State Plane North, feet
 SQFT_PER_ACRE = 43560.0
 SQM_PER_ACRE = 4046.8564224
 
-# Bands: category key in the parcel CSV, label, color
-VACANT = ('vacant', 'Vacant lots', '#FFB020')
-PAVED = ('paved', 'Paved lots, nothing built', '#C77DFF')
-PARKING = ('parking', 'Surface parking', '#FF4D5A')
-TRACT = ('tract', 'Undeveloped tracts, 1 acre+', '#5FB35F')
+# Government and land-trust owners of undeveloped tracts. Spot-checked against
+# the largest holders: Pinchot State Forest (DCNR), city parks such as Nay Aug,
+# the county's McDade Park, Countryside Conservancy preserves. Utilities
+# (PAWC's Lake Scranton, PPL corridors), railroads and nonprofits are not public.
+PUBLIC_OWNER = (r'DCNR|COMMONWEALTH OF PA|UNITED STATES|CITY OF SCRANTON|SCRANTON CITY OF'
+                r'|LACKAWANNA COUNTY|COUNTY OF LACK|SCRANTON SCHOOL DIST|HOUSING AUTH'
+                r'|PARKING AUTH|CONSERVANCY|LAND TRUST')
+
+
+def _cat(key):
+    return lambda p: p['category'] == key
+
+
+def _public(p):
+    return p['OwnerName'].fillna('').str.upper().str.contains(PUBLIC_OWNER, regex=True)
+
+
+# Bands: label, color, parcel selector
+VACANT = ('Vacant lots', '#FFB020', _cat('vacant'))
+PAVED = ('Paved lots, nothing built', '#C77DFF', _cat('paved'))
+PARKING = ('Surface parking', '#FF4D5A', _cat('parking'))
+TRACT = ('Undeveloped tracts, 1 acre+', '#5FB35F', _cat('tract'))
+TRACT_PUBLIC = ('Public or land-trust tracts, 1 acre+', '#2F7D5B',
+                lambda p: (p['category'] == 'tract') & _public(p))
+TRACT_PRIVATE = ('Privately held tracts, 1 acre+', '#7BC96F',
+                 lambda p: (p['category'] == 'tract') & ~_public(p))
+
+
+def _taxable(band):
+    """The same band restricted to taxable parcels."""
+    label, color, select = band
+    return label, color, lambda p: select(p) & p['taxable']
 
 # One figure per variant, bands listed bottom to top. The base figure leaves
 # out undeveloped tracts (mostly wooded hillside and mine land) so they do not
-# swamp the urban lots; the second adds them. Both leave out parking lots that
-# carry a building.
+# swamp the urban lots; the others add them whole, taxable only, or split by
+# owner. All leave out parking lots that carry a building.
 VARIANTS = [
     {'name': 'vacant_parking_gathered', 'bands': [VACANT, PAVED, PARKING],
      'headline': 'of Scranton is vacant or paved with nothing built on it.',
@@ -60,6 +87,20 @@ VARIANTS = [
     {'name': 'vacant_parking_gathered_with_tracts', 'bands': [TRACT, VACANT, PAVED, PARKING],
      'headline': 'of Scranton is undeveloped, vacant, or paved with nothing built on it.',
      'not_counted': 'parking lots that also hold a building.'},
+    {'name': 'vacant_parking_gathered_taxable_tracts',
+     'bands': [_taxable(b) for b in (TRACT, VACANT, PAVED, PARKING)],
+     'headline': 'of taxable land in Scranton is undeveloped, vacant, or paved bare.',
+     'not_counted': 'every tax-exempt parcel (state forest, city and county parks, land '
+                    'trusts, most utility land, churches, schools, nonprofits),\n'
+                    'and parking lots that also hold a building. Taxable means the county '
+                    'class code marks the parcel taxable.'},
+    {'name': 'vacant_parking_gathered_tracts_by_owner',
+     'bands': [TRACT_PUBLIC, TRACT_PRIVATE, VACANT, PAVED, PARKING],
+     'headline': 'of Scranton is undeveloped, vacant, or paved with nothing built on it.',
+     'not_counted': 'parking lots that also hold a building. Public tracts are owned by '
+                    'the state, city, county or a land trust; privately held\n'
+                    'tracts include utility, railroad and nonprofit land as well as '
+                    'individuals and companies.'},
 ]
 LABEL_GAP_FT = 1800       # from the square's side to its callout text
 LABEL_SPACING_FT = 3400   # minimum vertical gap between callouts on one side
@@ -113,11 +154,12 @@ def label_heights(targets: list, spacing: float) -> list:
     return out
 
 
-def render(variant: dict, acres_by_cat: dict, city: gpd.GeoDataFrame,
+def render(variant: dict, parcels: pd.DataFrame, city: gpd.GeoDataFrame,
            city_land_ac: float) -> dict:
     """Draw one variant's figure; return the numbers drawn on it."""
     bands = variant['bands']
-    acres = {key: acres_by_cat.get(key, 0.0) for key, _, _ in bands}
+    acres = {label: float(parcels.loc[select(parcels), 'acres'].sum())
+             for label, _, select in bands}
     total_ac = sum(acres.values())
     side = float(np.sqrt(total_ac * SQFT_PER_ACRE))  # feet
     x0, y0 = place_square(city.geometry.iloc[0], side)
@@ -136,8 +178,8 @@ def render(variant: dict, acres_by_cat: dict, city: gpd.GeoDataFrame,
 
     # The square, split by area into one band per category
     y, centres = y0, []
-    for key, _, color in bands:
-        band_h = side * acres[key] / total_ac
+    for label, color, _ in bands:
+        band_h = side * acres[label] / total_ac
         ax.add_patch(Rectangle((x0, y), side, band_h, facecolor=color,
                                edgecolor='none', zorder=5))
         centres.append(y + band_h / 2)
@@ -151,10 +193,10 @@ def render(variant: dict, acres_by_cat: dict, city: gpd.GeoDataFrame,
         idx = [i for i in range(len(bands)) if i % 2 == parity]
         heights = label_heights([centres[i] for i in idx], LABEL_SPACING_FT)
         for i, ty in zip(idx, heights):
-            key, label, _ = bands[i]
+            label = bands[i][0]
             left = parity == 0
             tx = x0 - LABEL_GAP_FT if left else x0 + side + LABEL_GAP_FT
-            ax.annotate(f'{label}\n{acres[key]:,.0f} acres',
+            ax.annotate(f'{label}\n{acres[label]:,.0f} acres',
                         xy=(x0 + side * 0.5, centres[i]), xytext=(tx, ty),
                         color=INK, fontsize=12.5, va='center', ha='right' if left else 'left',
                         zorder=8, linespacing=1.4,
@@ -192,21 +234,20 @@ def render(variant: dict, acres_by_cat: dict, city: gpd.GeoDataFrame,
     fig.savefig(out, facecolor=BG)
     plt.close(fig)
     print(f'wrote {out}')
-    return {**{f'{k}_acres': v for k, v in acres.items()}, 'total_acres': total_ac,
+    return {'band_acres': acres, 'total_acres': total_ac,
             'square_side_ft': side, 'square_side_mi': side / 5280,
             'city_land_acres': city_land_ac, 'pct_of_city_land': pct}
 
 
 def main() -> int:
     parcels = pd.read_csv(OUT_DIR / 'vacant_parking_parcels.csv', dtype={'ParcelPIN': str})
-    acres_by_cat = parcels.groupby('category')['acres'].sum().astype(float).to_dict()
 
     city = fetch_city('--refresh' in sys.argv)
     city_land_ac = float(city['AREALAND'].iloc[0]) / SQM_PER_ACRE
     city = city.to_crs(CRS_PLOT)
 
     for variant in VARIANTS:
-        stats = render(variant, acres_by_cat, city, city_land_ac)
+        stats = render(variant, parcels, city, city_land_ac)
         (OUT_DIR / f"{variant['name']}.json").write_text(json.dumps(stats, indent=2))
         print(json.dumps(stats, indent=2))
     return 0
