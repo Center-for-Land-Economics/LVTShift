@@ -23,7 +23,13 @@ Outputs, all regenerated and gitignored, in `analysis/reports/scranton/`:
   square on the city outline, its area equal to their summed ground area and split by
   category. Undeveloped tracts and parking with a building are left out, as its footnote
   says. `vacant_parking_gathered_with_tracts.png` adds the undeveloped tracts as their own
-  band; that square is too large to fit inside the outline, so it overhangs it. Each square
+  band; that square is too large to fit inside the outline, so it overhangs it.
+  `vacant_parking_gathered_taxable_tracts.png` counts taxable parcels only, in every band:
+  the land a land tax reaches. `vacant_parking_gathered_tracts_by_owner.png` splits the tract
+  band into public or land-trust owners (`PUBLIC_OWNER` in the script: the state forest,
+  city and county parks, land trusts) and everyone else, including utilities, railroads and
+  nonprofits. Lake Scranton's walking path is open to the public, but the land is Pennsylvania
+  American Water's, so it counts as privately held. Each square
   sits at the point nearest the city's centre where it fits, when one exists. The outline and the land-area denominator are the Census TIGERweb place boundary.
   The Scranton sibling of `philly_land_tax_research/scripts/build_philly_gathered_square.py`.
 
