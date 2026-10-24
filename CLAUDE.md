@@ -335,6 +335,10 @@ The `build_fort_collins_propinfo_cache.py` script (fetches per-parcel state tax 
 
 The Larimer County GIS parcel shapefile (`GIS_ParcelOwnerSHP.zip`) contains date fields (`DEEDDATE`, `SALEDATE`, `UPDATEDATE`) with year=0 values that Fiona cannot parse. Fix: `gpd.read_file(url, ignore_fields=['DEEDDATE', 'SALEDATE', 'UPDATEDATE'])`.
 
+## Scranton Notes
+
+The `GISViewer/Parcels` layer `cities/scranton/model.ipynb` fetches has every assessment field null. `GISViewer/LandRecords/MapServer/85` carries owner, class code and land/building values, but they are the pre-reassessment roll. Usable for telling built from unbuilt parcels, not for modeling the 2026 repeal. The 2026 roll is a paid County IT extract (`analysis/scranton_repeal/rtk_tracker.csv`). The idle-land work and its sources are in `analysis/scranton_repeal/vacant_parking/README.md`.
+
 ## Notebook Data-Scrape Variable Names
 
 Some notebooks use `scrape_data = 0` (Bellingham, Spokane) instead of `data_scrape = 0`. The batch runner patches both. When writing new notebooks, prefer `data_scrape` for consistency.
