@@ -18,6 +18,12 @@ Outputs, all regenerated and gitignored, in `analysis/reports/scranton/`:
 - `vacant_parking_parcels.csv`: every flagged parcel with its category and inputs.
 - `vacant_parking_summary.csv`: parcels and acres by category and tax status. Counts belong
   here, not in prose.
+- `vacant_parking_gathered.png` (+ `.json` of its numbers), from `build_gathered_square.py`
+  (run after the map script): the vacant, paved and surface-parking lots gathered into one
+  square on the city outline, its area equal to their summed ground area and split by
+  category. Undeveloped tracts and parking with a building are left out, as its footnote
+  says. The outline and the land-area denominator are the Census TIGERweb place boundary.
+  The Scranton sibling of `philly_land_tax_research/scripts/build_philly_gathered_square.py`.
 
 ## Sources
 
