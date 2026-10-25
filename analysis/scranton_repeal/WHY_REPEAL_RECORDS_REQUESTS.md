@@ -1,8 +1,8 @@
 # Records requests: why the split rate was repealed
 
-Drafted 2026-10-24 for `WHY_REPEAL.md`. **None has been sent.** Each fills a gap the public web
-does not cover: who proposed the single rate and on what analysis, the officials' own financial
-interests, and their donors. Status is logged in `rtk_tracker.csv`. Add the requester's name and
+Drafted 2026-10-24 (Request 6 on 2026-10-25) for `WHY_REPEAL.md`. **None has been sent.**
+Each fills a gap the public web does not cover: who proposed the single rate and on what
+analysis, the officials' own financial interests, their donors, and the assessment appeals. Status is logged in `rtk_tracker.csv`. Add the requester's name and
 address at sending; keep the as-sent copy in `rtk_outbox/` (git-ignored, because it carries that
 address), as for requests 1 and 2 in `RTKL_REQUEST_DRAFT.md`.
 
@@ -97,3 +97,41 @@ written request should be enough; send it under the Right-to-Know Law,
 to Traci Harte (as for Request 1), only if the Department asks for one. Under the City's Code of
 Ethics (§ 12(2)(B)(i)), candidates also file a duplicate with the City Clerk, a second source if
 the County is slow.
+
+---
+
+## Request 6: Lackawanna County, assessment appeals for Scranton parcels
+
+**To:** Traci Harte, Deputy Chief of Staff / Right-to-Know Officer, as for Request 1
+(hartet@lackawannacounty.org). Request 1 asked for appeal fields, but County IT's reply on the
+paid extract (2026-10-01) did not say whether they are included. Ask IT to add them to the
+extract in the same email; this request covers the records if they are not.
+
+**Records requested** (Right-to-Know Law, 65 P.S. § 67.101 et seq.), for every parcel in the
+**City of Scranton**:
+
+1. Any existing list, log, docket or database export (for example from the iasWorld appeals
+   module) of the **informal reviews** and **Board of Assessment Appeals** appeals filed against
+   the reassessed values for tax year 2026, and of any appeals filed in 2026 for tax year 2027.
+   For each appeal, where maintained: parcel identifier, appellant (owner or taxing district),
+   filing date, hearing date, the land, building and total values before and after the
+   decision, the decision, and its date.
+2. If no such list exists, the Board's written decision notices for those appeals, in
+   electronic form.
+3. Any existing list kept by the County Law Department or Solicitor of **Court of Common Pleas**
+   tax assessment appeals from those Board decisions, with parcel identifier, docket number,
+   status and any settlement or stipulated value.
+4. Any existing summary or report of appeal counts or value changes by municipality or property
+   class.
+
+Electronic copies (CSV, Excel or PDF) by email are preferred.
+
+*Why:* appeals bear on the memo two ways. The 2026 extract is current values, not the roll as
+certified, so the appeal record is what separates the two. And whether appeals ran
+disproportionately against land values, and who filed them, tests the hypothesis that distrust
+of the new land values made a land-weighted tax hard to defend.
+
+*Note:* the County's 2026-09-29 letter cited § 705 (no duty to create a record), so each item
+asks only for records that already exist. Common Pleas dockets are judicial records, outside the
+Right-to-Know Law; they can be searched at the Prothonotary's office (or the Court's public
+docket) if item 3 comes back empty.

@@ -9,24 +9,39 @@ dollar figures are not anyone's 2026 change. The ranking of who gains (land
 with little building on it) follows from the tax's structure and is the
 part meant to carry over.
 
+It also tests the budget's claim that most vacant, developable land is
+built on, against the Philadelphia/Scranton idle-land comparison (both
+cities through lvt/idle_land.py) and a side-yard check on Scranton's
+vacant lots.
+
 Reads vacant_parking/data/scranton_landrecords_raw.parquet (County layer
-GISViewer/LandRecords/MapServer/85, cached by build_vacant_parking_map.py).
+GISViewer/LandRecords/MapServer/85, cached by build_vacant_parking_map.py),
+analysis/reports/scranton/vacant_parking_parcels.csv (written by
+build_vacant_parking_map.py), and the comparison JSON in the sibling repo
+philly_land_tax_research (analysis/idle_land/results/comparison.json).
 
 Usage:
     python why_repeal_old_roll.py           # regenerate WHY_REPEAL.md in place
     python why_repeal_old_roll.py --check   # exit 1 with a diff if it is stale
 """
 import difflib
+import json
 import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import geopandas as gpd
 import pandas as pd
 
 HERE = Path(__file__).resolve().parent
 ROLL = HERE / 'vacant_parking' / 'data' / 'scranton_landrecords_raw.parquet'
 MEMO = HERE / 'WHY_REPEAL.md'
+REPO_ROOT = HERE.parents[1]
+IDLE_PARCELS = REPO_ROOT / 'analysis' / 'reports' / 'scranton' / 'vacant_parking_parcels.csv'
+COMPARISON = (REPO_ROOT.parent / 'philly_land_tax_research' / 'analysis' / 'idle_land'
+              / 'results' / 'comparison.json')
+SIDE_YARD_FT = 5  # a vacant lot within this distance of a built lot with the same owner name
 
 LAND_MILLS = 249.19765
 BLDG_MILLS = 52.60679
@@ -143,6 +158,59 @@ def build(df: pd.DataFrame) -> Dict[str, str]:
     return k
 
 
+def side_yards() -> Tuple[int, int, float, float]:
+    """Taxable vacant lots (under 1 acre) touching a built lot with the same owner name.
+
+    Returns (lots, side-yard lots, acres, side-yard acres). Owner names are
+    matched as written, so a side yard held under a different spelling is
+    missed and the count is a floor.
+    """
+    v = pd.read_csv(IDLE_PARCELS, dtype={'ParcelPIN': str})
+    v = v[(v['category'] == 'vacant') & v['taxable']].set_index('ParcelPIN')
+    r = gpd.read_parquet(ROLL, columns=['ParcelPIN', 'OwnerName', 'ImprovedValue', 'geometry'])
+    r['ImprovedValue'] = pd.to_numeric(r['ImprovedValue'], errors='coerce').fillna(0)
+    r = r.to_crs('EPSG:2271')  # PA State Plane North, feet
+    r['own'] = r['OwnerName'].str.strip().str.upper()
+    lots = r[r['ParcelPIN'].isin(v.index)].dissolve('ParcelPIN', aggfunc='first').reset_index()
+    lots['geometry'] = lots.buffer(SIDE_YARD_FT)
+    built = r.loc[r['ImprovedValue'] > 0, ['own', 'geometry']]
+    j = gpd.sjoin(lots[['ParcelPIN', 'own', 'geometry']], built, predicate='intersects')
+    side = v.index.isin(j.loc[j['own_left'] == j['own_right'], 'ParcelPIN'].unique())
+    return len(v), int(side.sum()), float(v['acres'].sum()), float(v.loc[side, 'acres'].sum())
+
+
+def vacant_claim() -> Dict[str, str]:
+    """The budget's vacant-land claim against both cities' idle-land shares."""
+    comp = json.loads(COMPARISON.read_text(encoding='utf-8'))
+    cats, taxable = comp['categories'], comp['taxable_acres']
+    order = ['parking', 'paved', 'vacant', 'urban', 'tract', 'all_idle']
+    labels = {'urban': '**Urban idle land** (the three above)', 'all_idle': '**All idle land**',
+              'tract': 'Undeveloped tract (1 acre or more)'}
+    rows = []
+    for c in order:
+        cell = lambda city: f"{cats[c][city + '_pct'] / 100:.1%} ({cats[c][city + '_acres']:,.0f} acres)"
+        rows.append([labels.get(c, cats[c]['label']), cell('philadelphia'), cell('scranton')])
+
+    vp = {city: (cats['vacant'][city + '_acres'] + cats['parking'][city + '_acres']) / taxable[city]
+          for city in ['philadelphia', 'scranton']}
+    n, n_side, ac, ac_side = side_yards()
+    sc_filtered = vp['scranton'] - ac_side / taxable['scranton']
+
+    k: Dict[str, str] = {}
+    k['IDLE_TABLE'] = table(rows, ['Share of taxable land', 'Philadelphia', 'Scranton'])
+    k['IDLE_URBAN_SC'] = f"{cats['urban']['scranton_pct'] / 100:.1%}"
+    k['IDLE_URBAN_PH'] = f"{cats['urban']['philadelphia_pct'] / 100:.1%}"
+    k['IDLE_VP_SC'] = f"{vp['scranton']:.1%}"
+    k['IDLE_VP_PH'] = f"{vp['philadelphia']:.1%}"
+    k['IDLE_VP_RATIO'] = f"{vp['scranton'] / vp['philadelphia']:.1f}"
+    k['SIDE_YARD_LOTS'] = f'{n_side:,} of {n:,}'
+    k['SIDE_YARD_ACRES'] = f'{ac_side:,.0f} of {ac:,.0f}'
+    k['IDLE_VP_SC_FILTERED'] = f'{sc_filtered:.1%}'
+    k['IDLE_VP_RATIO_FILTERED'] = f"{sc_filtered / vp['philadelphia']:.1f}"
+    k['SIDE_YARD_FT'] = str(SIDE_YARD_FT)
+    return k
+
+
 def fill(text: str, keys: Dict[str, str]) -> str:
     for key, val in keys.items():
         pat = re.compile(rf'(<!--AUTOGEN:{key}-->)(.*?)(<!--/AUTOGEN:{key}-->)', re.S)
@@ -154,7 +222,7 @@ def fill(text: str, keys: Dict[str, str]) -> str:
 
 
 def main() -> None:
-    keys = build(load())
+    keys = {**build(load()), **vacant_claim()}
     old = MEMO.read_text(encoding='utf-8')
     new = fill(old, keys)
     if '--check' in sys.argv:
