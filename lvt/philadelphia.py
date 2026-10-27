@@ -1022,13 +1022,13 @@ class LandSurfaceResult:
             f"land surface '{d['label']}': {d['n_matched']:,} parcels joined "
             f"({d['match_rate']:.1%}); {d['n_knn']:,} filled by {d['knn_k']}-NN rate "
             f"(carrying {d['knn_value_share']:.1%} of market value) | "
-            f"improved cap: {d['n_capped']:,} parcels, "
+            f"cap on parcels with a building ({d.get('bare_rule', 'category_code')} is bare): {d['n_capped']:,} parcels, "
             f"${d['land_base_pre_cap']/1e9:.2f}B -> ${d['land_base_post_cap']/1e9:.2f}B "
             f"({d['cap_removed_share']:.1%} removed) | "
             f"land > total on {d['n_land_exceeds_total']:,} improved parcels before the cap"
             + ("" if not d.get("support_edge_sqft") else
                f" | beyond the {d['support_edge_sqft']:,.0f} sqft support edge: {d['n_beyond_support']:,} parcels, "
-               f"{d['n_carried_at_opa']:,} vacant ones carried at OPA (${d['carried_value']/1e9:.2f}B, "
+               f"{d['n_carried_at_opa']:,} bare ones carried at OPA (${d['carried_value']/1e9:.2f}B, "
                f"against ${d['surface_value_on_carried']/1e9:.2f}B painted)")
         )
 
@@ -1046,6 +1046,7 @@ def paint_land_surface(
     label: "str | None" = None,
     support: "dict | None" = None,
     carry_col: str = "opa_gross_land",
+    building_col: "str | None" = "opa_gross_building",
 ) -> LandSurfaceResult:
     """Paint an externally estimated land $/sqft surface onto LVTShift's parcel frame.
 
@@ -1065,12 +1066,19 @@ def paint_land_surface(
     outside GMA coverage -- and are flagged `source == 'knn'` so the report can say how much
     of the base rests on the fill.
 
-    The improved-parcel cap follows LYCD's convention exactly (land clipped at
-    `market_value`, vacant parcels uncapped) so that a surface swapped in through this
-    function changes one thing -- the rate -- and nothing else about how the notebooks treat
-    it. `n_land_exceeds_total` counts how often the surface's land alone exceeds OPA's total
-    assessment before the cap binds: under the draft ordinance's Sec. 3(c) that is not a
-    permitted assessment, so it is a finding about the totals, and the report needs the count.
+    A parcel with a building has its land clipped at `market_value`; a bare one is taken whole.
+    "Bare" is OPA's own split: `building_col` (gross building, taxable plus exempt) at $1 or
+    less -- the same test the re-split's `uncap_bare_land` applies, so the painted land and the
+    reform that reads it agree on which lots are bare. The category code is not the test: OPA
+    files lots built on after the roll was set, parking lots and parkland under improved codes
+    with a $0 building line, and some vacant-coded parcels (parking, playgrounds) carry most of
+    their value on a building line; on TY2026 the code rule capped ~730 bare lots at OPA's land
+    and left ~140 parcels with a building uncapped above their total. `building_col=None` keeps
+    the category-code rule (LYCD's own convention, `compute_lycd_land_values`).
+    `n_land_exceeds_total` counts how often the surface's land alone exceeds OPA's total
+    assessment on a parcel with a building before the cap binds: under the draft ordinance's
+    Sec. 3(c) that is not a permitted assessment, so it is a finding about the totals, and the
+    report needs the count.
 
     `support` is the surface's own statement of where its evidence ends: the parsed
     `land_surface_support.json` that `run_land_surfaces.py` writes beside the surface
@@ -1079,10 +1087,10 @@ def paint_land_surface(
     cannot speak to. (1) The KNN fill re-sizes each neighbour's rate to the subject's own lot
     (`_knn_resized_rate_fill`) and draws only on neighbours inside the support edge. (2) Every
     parcel whose own lot, or whose painted lot, exceeds the edge is flagged `beyond_support`.
-    (3) A flagged VACANT parcel whose OPA land value is its whole market value is carried at
-    `carry_col` (OPA's own gross land value) and marked `source == 'opa_beyond_support'`: an improved parcel's land is capped at its total,
-    so an extrapolated rate cannot add value to the base, but a vacant lot is taken whole and
-    nothing bounds it (audit 2026-09-21, finding 3). The rate is kept on every flagged parcel, so a
+    (3) A flagged BARE parcel (by the same test as the cap) is carried at `carry_col` (OPA's own
+    gross land value) and marked `source == 'opa_beyond_support'`: a parcel with a building has
+    its land capped at its total, so an extrapolated rate cannot add value to the base, but a bare
+    lot is taken whole and nothing bounds it (audit 2026-09-21, finding 3). The rate is kept on every flagged parcel, so a
     reform step can still rescale it (`relevel_beyond_support`) instead of taking the carry. Without
     `support` the function behaves exactly as before, for surfaces that publish no edge.
 
@@ -1090,8 +1098,8 @@ def paint_land_surface(
     ----------
     gdf : GeoDataFrame
         Needs `parcel_col`, `category_code`, `market_value`, `area_col` (run
-        `compute_lycd_land_values` first) and point geometry; `carry_col` when `support` is
-        given.
+        `compute_lycd_land_values` first), `building_col` unless it is None, and point
+        geometry; `carry_col` when `support` is given.
     surface : DataFrame
         `parcel_col` (any zero-padding; normalised to 9 digits) and `rate_col` in $/sqft.
     rate_col : str
@@ -1131,25 +1139,32 @@ def paint_land_surface(
     market = pd.to_numeric(gdf["market_value"], errors="coerce")
     cat = pd.to_numeric(gdf["category_code"].astype(str).str.strip(), errors="coerce").astype("Int64").astype(str)
     is_vac = cat.isin(set(str(c) for c in vacant_codes))
+    if building_col is None:
+        bare = is_vac
+    else:
+        if building_col not in gdf.columns:
+            raise KeyError(f"paint_land_surface: '{building_col}' (OPA's gross building line) is needed to tell bare "
+                           "lots from built ones; pass building_col=None for the category-code rule")
+        bare = pd.to_numeric(gdf[building_col], errors="coerce").fillna(0.0).le(1.0)
 
     land = (psf_filled * area).clip(lower=0).fillna(0.0)
-    # Bare by OPA's own split too, not by the category code alone: OPA books most of the value
-    # of many vacant-coded parcels (parking lots, parkland) to a building line, and carrying its
-    # land figure alone would strip that value out of land. Those have a total to cap against.
+    # Bare by OPA's own split, not by the category code: OPA books most of the value of many
+    # vacant-coded parcels (parking lots, parkland) to a building line, and carrying its land
+    # figure alone would strip that value out of land. Those have a total to cap against.
     opa_land = pd.to_numeric(gdf[carry_col], errors="coerce") if support else None
-    carried = (beyond & is_vac & opa_land.notna() & (market.fillna(0).clip(lower=0) - opa_land.fillna(0)).le(1.0)
-               if support else beyond & is_vac)
+    carried = (beyond & bare & opa_land.notna() & (market.fillna(0).clip(lower=0) - opa_land.fillna(0)).le(1.0)
+               if support else beyond & bare)
     surface_value_on_carried = float(land[carried].sum())
     if carried.any():
         land = land.where(~carried, opa_land.fillna(0.0).clip(lower=0))
         source = source.where(~carried, "opa_beyond_support")
     pre_cap = float(land.sum())
     mv = market.fillna(0).clip(lower=0)
-    exceeds = (land > mv) & ~is_vac & (mv > 0)
+    exceeds = (land > mv) & ~bare & (mv > 0)
     n_capped = 0
     if cap_improved_at_market:
         n_capped = int(exceeds.sum())
-        land = pd.Series(np.where(~is_vac, np.minimum(land, mv), land), index=out_index)
+        land = pd.Series(np.where(~bare, np.minimum(land, mv), land), index=out_index)
     post_cap = float(land.sum())
 
     mv_total = float(mv.sum())
@@ -1164,6 +1179,9 @@ def paint_land_surface(
         "knn_value_share": float(mv[~matched].sum() / mv_total) if mv_total else float("nan"),
         "n_capped": n_capped,
         "n_land_exceeds_total": int(exceeds.sum()),
+        "bare_rule": "category_code" if building_col is None else f"{building_col} <= $1",
+        "n_bare_with_improved_code": int((bare & ~is_vac).sum()),
+        "n_built_with_vacant_code": int((~bare & is_vac).sum()),
         "land_base_pre_cap": pre_cap,
         "land_base_post_cap": post_cap,
         "cap_removed_share": (pre_cap - post_cap) / pre_cap if pre_cap > 0 else float("nan"),
