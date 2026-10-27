@@ -744,6 +744,8 @@ def _painted_city():
     covers zone A only -- zone B is the 'not in the AVM universe' cohort."""
     gdf, gma, pin_areas = _toy_city()
     gdf = compute_lycd_land_values(gdf, gma, pin_areas).gdf
+    # OPA's gross building line: four-fifths of value on the improved parcels, none on the vacant lots.
+    gdf["opa_gross_building"] = np.where(gdf["category_code"].eq("6"), 0.0, 0.8 * gdf["market_value"])
     in_a = gdf["zone"].eq("A")
     surface = pd.DataFrame({
         # un-padded keys on purpose: the join must normalise to 9 digits
@@ -791,6 +793,34 @@ def test_paint_surface_cap_binds_on_improved_only():
     off = paint_land_surface(gdf, surface, rate_col="s2_k20", knn_k=3, cap_improved_at_market=False)
     assert off.diagnostics["n_capped"] == 0
     assert off.land_value[a_imp] == pytest.approx(1_000.0 * 1_000.0)
+
+
+def test_paint_surface_bare_is_opas_building_line_not_the_category_code():
+    gdf, surface = _painted_city()
+    surface["s2_k20"] = 1_000.0      # land far above every total, so the cap binds wherever it applies
+    a_imp, a_imp2 = gdf[gdf["zone"].eq("A") & gdf["category_code"].eq("1")].index[:2]
+    a_vac = gdf[gdf["zone"].eq("A") & gdf["category_code"].eq("6")].index[0]
+    gdf.loc[a_imp2, "opa_gross_building"] = 0.0                       # improved code, $0 building: bare
+    gdf.loc[a_vac, "opa_gross_building"] = 0.6 * gdf.loc[a_vac, "market_value"]   # vacant code, a building line
+    res = paint_land_surface(gdf, surface, rate_col="s2_k20", knn_k=3)
+    assert res.land_value[a_imp] == pytest.approx(gdf.loc[a_imp, "market_value"])            # built: capped
+    assert res.land_value[a_imp2] == pytest.approx(1_000.0 * gdf.loc[a_imp2, "dor_area_sqft"])  # bare: whole
+    assert res.land_value[a_vac] == pytest.approx(gdf.loc[a_vac, "market_value"])            # built: capped
+    d = res.diagnostics
+    assert d["bare_rule"] == "opa_gross_building <= $1"
+    assert d["n_bare_with_improved_code"] == 1 and d["n_built_with_vacant_code"] == 1
+
+
+def test_paint_surface_category_rule_is_an_explicit_opt_in():
+    gdf, surface = _painted_city()
+    surface["s2_k20"] = 1_000.0
+    a_imp2 = gdf[gdf["zone"].eq("A") & gdf["category_code"].eq("1")].index[1]
+    gdf.loc[a_imp2, "opa_gross_building"] = 0.0
+    old = paint_land_surface(gdf, surface, rate_col="s2_k20", knn_k=3, building_col=None)
+    assert old.land_value[a_imp2] == pytest.approx(gdf.loc[a_imp2, "market_value"])   # the code rule caps it
+    assert old.diagnostics["bare_rule"] == "category_code"
+    with pytest.raises(KeyError, match="opa_gross_building"):
+        paint_land_surface(gdf.drop(columns="opa_gross_building"), surface, rate_col="s2_k20", knn_k=3)
 
 
 # --- paint_land_surface with a published support edge ---------------------------------------
@@ -852,6 +882,17 @@ def test_paint_surface_carries_a_vacant_tract_beyond_the_edge_at_opa():
     d = res.diagnostics
     assert d["n_carried_at_opa"] == 1 and d["carried_value"] == pytest.approx(gdf.loc[b_vac, "opa_gross_land"])
     assert d["surface_value_on_carried"] == pytest.approx(res.psf[b_vac] * 5_000_000.0)
+
+
+def test_paint_surface_carries_a_bare_lot_with_an_improved_code_beyond_the_edge():
+    gdf, surface = _supported_city()
+    b = gdf[gdf["zone"].eq("B") & gdf["category_code"].eq("1")].index[0]
+    gdf.loc[b, "dor_area_sqft"] = 5_000_000.0
+    gdf.loc[b, ["opa_gross_building", "opa_gross_land"]] = [0.0, gdf.loc[b, "market_value"]]
+    res = paint_land_surface(gdf, surface, rate_col="s2_k20", knn_k=3, support=SUPPORT)
+    # Bare on OPA's split, so neither capped nor taken at an extrapolated rate: carried at OPA.
+    assert res.source[b] == "opa_beyond_support"
+    assert res.land_value[b] == pytest.approx(gdf.loc[b, "opa_gross_land"])
 
 
 def test_paint_surface_honours_the_surfaces_own_flag_and_skips_flagged_donors():

@@ -333,15 +333,18 @@ the code in `lvt/philadelphia.py`.
 - **`paint_land_surface`** imports an external land **rate**, never a dollar value, and
   multiplies it by this repo's own `dor_area_sqft`, which keeps the two repos' area conventions
   decoupled. Parcels outside the AVM universe take their nearest matched neighbours' median rate
-  and are flagged `land_surface_source == 'knn'`; the improved cap is LYCD's, so a swap changes
-  the rate and nothing else. Given `support=` (the sibling repo's `land_surface_support.json`),
+  and are flagged `land_surface_source == 'knn'`. Land is capped at the total only on a parcel
+  with a building on OPA's own split (`opa_gross_building` above $1), the test the re-split's
+  `uncap_bare_land` uses; a bare lot is taken whole whatever its category code (OPA files lots
+  built on after the roll, parking and parkland under improved codes with a $0 building line).
+  `building_col=None` restores LYCD's category-code cap. Given `support=` (the sibling repo's `land_surface_support.json`),
   it does three more things. The KNN fill re-sizes each neighbour's rate to the subject's own lot
   (`_knn_resized_rate_fill`) and draws only on in-support neighbours, because a neighbour's rate
   describes a lot of the neighbour's size. Every parcel whose own or painted lot exceeds the
-  support edge is flagged `land_beyond_support`. And a flagged VACANT parcel is carried at
-  `opa_gross_land` (`opa_beyond_support`); improved parcels are left alone because the
-  market-value cap already bounds them. `uncap_bare_land` applies the same rule to its wider
-  definition of bare (no building value, whatever the category) through `beyond_support`.
+  support edge is flagged `land_beyond_support`. And a flagged bare parcel is carried at
+  `opa_gross_land` (`opa_beyond_support`); parcels with a building are left alone because the
+  market-value cap already bounds them. `uncap_bare_land` applies the same rule, by the same
+  definition of bare, through `beyond_support`.
 - **`relevel_beyond_support`** is the reform step's reading of those flagged parcels, built and
   bare alike: the surface's own uncapped value divided by its held-out median ratio to price in
   the lot's size band (`large_lot_band_factor`: edge to 1 acre, 1 acre and over), with the
