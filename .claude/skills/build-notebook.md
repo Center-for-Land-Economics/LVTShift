@@ -164,6 +164,18 @@ print(gdf['PROPERTY_CATEGORY'].value_counts())
 
 When a city provides detailed assessor class codes, prefer a small city-specific classifier function over a flat one-to-one map. Split condos, townhomes/rowhouses, mixed-use parcels, hotels, office/commercial condos, and retail/general commercial when the source codes support those distinctions. Keep `Other Residential`, `Other Commercial`, and `Other` as residual buckets, then print the source-code counts inside those residuals and refine the mapping if they are large.
 
+**Optional — waterfront single-family split.** For cities with significant water frontage AND a decent chunk of waterfront single-family homes, split SFH into waterfront vs non-waterfront here (after classification, before the tax model) using `lvt/waterfront_utils.py`. This is the one canonical utility — do not hand-roll a per-city distance computation. See Part D2 of `model-policy.md` for the "decent chunk" gate and the full code; the short version:
+
+```python
+from lvt.waterfront_utils import add_waterfront_flags, waterfront_share, split_single_family_by_waterfront
+gdf = add_waterfront_flags(gdf, fips_code=FIPS, cache_dir=DATA_DIR, min_water_area_m2=10_000)
+stats = waterfront_share(gdf, category_col='PROPERTY_CATEGORY')
+if stats['waterfront_pct'] >= 2.0:  # decent chunk of SFH on the water
+    gdf = split_single_family_by_waterfront(gdf, category_col='PROPERTY_CATEGORY')
+```
+
+Landlocked cities skip this. When applied, note the waterfront share in a markdown cell.
+
 ---
 
 ## Section 4 — Current Tax Model

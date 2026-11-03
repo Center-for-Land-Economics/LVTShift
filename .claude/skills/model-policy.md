@@ -307,6 +307,56 @@ Key override rule: **any parcel with $0 improvement value → 'Vacant Land'**, r
 df.loc[df['improvement_value'] <= 0, 'PROPERTY_CATEGORY'] = 'Vacant Land'
 ```
 
+### D2. Optional: Waterfront single-family split
+
+Shoreline proximity is one of the largest single drivers of residential land
+value. In a city with meaningful water frontage, the "Single Family
+Residential" median masks a small band of high-land-value shoreline parcels
+that behave very differently from the interior — which is exactly the signal an
+LVT analysis is trying to surface. For those cities, split single-family homes
+into waterfront and non-waterfront.
+
+**When to apply it (the "decent chunk" gate).** Only split when *both* hold:
+1. The city has significant water frontage — a coast/bay/estuary, or a major
+   lake or wide river (not just creeks and retention ponds).
+2. A non-trivial share of the single-family stock is actually on the water —
+   as a rule of thumb, **≥ ~2% of single-family parcels within 100 m of
+   significant water, or several hundred parcels**, whichever the city's size
+   makes meaningful. Use `waterfront_share()` to check before deciding.
+
+If the city is plainly landlocked, or the waterfront SFH count is trivial, skip
+this — do not add a near-empty category.
+
+**How (uses `lvt/waterfront_utils.py`, the single canonical utility — never
+hand-roll a per-city distance computation):**
+
+```python
+from lvt.waterfront_utils import (
+    add_waterfront_flags, waterfront_share, split_single_family_by_waterfront,
+)
+
+# 1. Flag parcels by distance to nearest TIGER water (cached in the city data dir).
+#    min_water_area_m2 screens out drainage ponds; ~10,000 (1 ha) is a good floor.
+gdf = add_waterfront_flags(
+    gdf, fips_code=FIPS, cache_dir=DATA_DIR, min_water_area_m2=10_000,
+)
+
+# 2. Decide with the gate above.
+stats = waterfront_share(gdf, category_col='PROPERTY_CATEGORY')
+print(stats)  # {'sfh_total': ..., 'waterfront_count': ..., 'waterfront_pct': ...}
+
+# 3. If it clears the gate, split SFH (default flag = within 100 m).
+if stats['waterfront_pct'] >= 2.0:
+    gdf = split_single_family_by_waterfront(gdf, category_col='PROPERTY_CATEGORY')
+    # → 'Single Family Residential — Waterfront' vs 'Single Family Residential'
+```
+
+The split only rewrites the category string, so it flows through
+`calculate_category_tax_summary`, the city report, and `save_standard_export`
+with no other changes. Do this **after** classification and **before** the
+census join / export. Record in a markdown cell that the split was applied (and
+the waterfront share), or that it was considered and skipped.
+
 ---
 
 ## Part E — Output Checklist

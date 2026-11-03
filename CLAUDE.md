@@ -72,6 +72,7 @@ lvt/census_utils.py    → Fetch Census demographics, spatial join to parcels
 lvt/lvt_utils.py       → Tax modeling (split-rate, abatement, exemptions)
 lvt/policy_analysis.py → Identify vacant land, parking lots, development barriers
 lvt/transit_utils.py   → GTFS feeds, routed walk-shed isochrones, OSM parking analysis
+lvt/waterfront_utils.py→ TIGER water fetch, per-parcel distance-to-water flags, waterfront SFH split
 lvt/viz.py             → Scatter plots, quintile analysis, demographic charts, city report
 lvt/parcel_map.py      → Per-parcel GeoParquet export + self-contained interactive HTML map
 ```
